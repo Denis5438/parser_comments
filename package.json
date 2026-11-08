@@ -2,12 +2,13 @@
   "name": "giveaway-contest-bot",
   "version": "1.0.0",
   "description": "Telegram bot for collecting comments and deduplicating giveaway participants across YouTube, VK, Dzen and Instagram",
-  "main": "src/index.ts",
+  "main": "server.js",
   "type": "module",
   "scripts": {
-    "start": "tsx src/index.ts",
+    "start": "node server.js",
     "dev": "tsx watch src/index.ts",
     "build": "tsc",
+    "postinstall": "npm run build",
     "test": "tsx test/deduplication.test.ts && tsx test/excel.test.ts && tsx test/health.test.ts"
   },
   "keywords": [
