@@ -1,0 +1,174 @@
+import { VK } from 'vk-io';
+import { RawComment, ScrapingOptions } from '../types.js';
+import { config } from '../config.js';
+
+export class VkScraper {
+  /**
+   * Извлекает тип объекта (wall или video), owner_id и item_id из ссылки ВКонтакте
+   */
+  public parseUrl(url: string): { type: 'wall' | 'video'; ownerId: number; itemId: number } | null {
+    try {
+      const parsed = new URL(url);
+      const pathname = parsed.pathname;
+      const search = parsed.search;
+
+      // Формат feed?w=wall-123_456
+      if (search.includes('w=wall') || search.includes('w=video')) {
+        const match = search.match(/w=(wall|video)(-?\d+)_(\d+)/);
+        if (match) {
+          return {
+            type: match[1] as 'wall' | 'video',
+            ownerId: parseInt(match[2], 10),
+            itemId: parseInt(match[3], 10),
+          };
+        }
+      }
+
+      // Формат /wall-123_456 или /video-123_456
+      const directMatch = pathname.match(/\/(wall|video)(-?\d+)_(\d+)/);
+      if (directMatch) {
+        return {
+          type: directMatch[1] as 'wall' | 'video',
+          ownerId: parseInt(directMatch[2], 10),
+          itemId: parseInt(directMatch[3], 10),
+        };
+      }
+
+      return null;
+    } catch {
+      return null;
+    }
+  }
+
+  /**
+   * Выкачивает комментарии к публикации или видео ВКонтакте
+   */
+  public async fetchComments(url: string, options: ScrapingOptions): Promise<RawComment[]> {
+    const target = this.parseUrl(url);
+    if (!target) {
+      throw new Error(
+        'Не удалось распознать ссылку VK. Поддерживаются ссылки вида vk.com/wall-123_456 или vk.com/video-123_456'
+      );
+    }
+
+    if (!config.vkServiceToken) {
+      throw new Error(
+        'Не указан VK_SERVICE_TOKEN в файле .env. Создайте приложение на vk.com/dev и скопируйте сервисный ключ.'
+      );
+    }
+
+    const vk = new VK({
+      token: config.vkServiceToken,
+    });
+
+    const comments: RawComment[] = [];
+    let offset = 0;
+    const count = 100;
+    let totalCount = Infinity;
+
+    while (offset < totalCount) {
+      if (target.type === 'wall') {
+        const response = await vk.api.wall.getComments({
+          owner_id: target.ownerId,
+          post_id: target.itemId,
+          offset,
+          count,
+          extended: 1,
+          fields: ['screen_name', 'first_name', 'last_name'],
+          need_likes: 0,
+        });
+
+        totalCount = response.count;
+        const profilesMap = new Map<number, string>();
+        for (const p of response.profiles || []) {
+          profilesMap.set(p.id, `${p.first_name} ${p.last_name}`);
+        }
+        for (const g of response.groups || []) {
+          profilesMap.set(-g.id, g.name || 'Сообщество');
+        }
+
+        for (const item of response.items) {
+          // Игнорируем удаленные комментарии
+          if (item.deleted) continue;
+
+          const fromId = item.from_id;
+          const authorName = profilesMap.get(fromId) || `ID ${fromId}`;
+          const profileUrl = fromId > 0 ? `https://vk.com/id${fromId}` : `https://vk.com/club${Math.abs(fromId)}`;
+
+          comments.push({
+            userId: String(fromId),
+            username: authorName,
+            profileUrl,
+            commentText: item.text || '',
+            createdAt: new Date(item.date * 1000),
+            commentId: String(item.id),
+            isReply: Boolean(item.reply_to_comment || item.reply_to_user),
+          });
+
+          // Вложенная ветка ответов (threads)
+          if (options.includeReplies && item.thread && item.thread.count > 0 && item.thread.items) {
+            for (const reply of item.thread.items) {
+              const replyFromId = reply.from_id;
+              const replyAuthorName = profilesMap.get(replyFromId) || `ID ${replyFromId}`;
+              const replyUrl = replyFromId > 0 ? `https://vk.com/id${replyFromId}` : `https://vk.com/club${Math.abs(replyFromId)}`;
+
+              comments.push({
+                userId: String(replyFromId),
+                username: replyAuthorName,
+                profileUrl: replyUrl,
+                commentText: reply.text || '',
+                createdAt: new Date(reply.date * 1000),
+                commentId: String(reply.id),
+                isReply: true,
+              });
+            }
+          }
+        }
+      } else {
+        // target.type === 'video'
+        const response = await vk.api.video.getComments({
+          owner_id: target.ownerId,
+          video_id: target.itemId,
+          offset,
+          count,
+          extended: 1,
+          need_likes: 0,
+        });
+
+        totalCount = response.count;
+        const profilesMap = new Map<number, string>();
+        for (const p of response.profiles || []) {
+          profilesMap.set(p.id, `${p.first_name} ${p.last_name}`);
+        }
+        for (const g of response.groups || []) {
+          profilesMap.set(-g.id, g.name || 'Сообщество');
+        }
+
+        for (const item of response.items) {
+          const fromId = item.from_id;
+          const authorName = profilesMap.get(fromId) || `ID ${fromId}`;
+          const profileUrl = fromId > 0 ? `https://vk.com/id${fromId}` : `https://vk.com/club${Math.abs(fromId)}`;
+
+          comments.push({
+            userId: String(fromId),
+            username: authorName,
+            profileUrl,
+            commentText: item.message || '',
+            createdAt: new Date(item.date * 1000),
+            commentId: String(item.id),
+            isReply: Boolean(item.reply_to_comment || item.reply_to_user),
+          });
+        }
+      }
+
+      offset += count;
+      if (options.onProgress) {
+        await options.onProgress(comments.length);
+      }
+    }
+
+    return comments;
+  }
+}
+
+export const vkScraper = new VkScraper();
