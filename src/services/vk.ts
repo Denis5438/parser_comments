@@ -93,11 +93,16 @@ export class VkScraper {
               extended: 1,
               fields: ['screen_name', 'first_name', 'last_name'],
               need_likes: 0,
+              thread_items_count: 10,
             }),
           `wall.getComments (offset ${offset})`
         );
 
         totalCount = response.count;
+        if (!response.items || response.items.length === 0) {
+          break;
+        }
+
         const profilesMap = new Map<number, string>();
         for (const p of response.profiles || []) {
           profilesMap.set(p.id, `${p.first_name} ${p.last_name}`);
@@ -125,11 +130,54 @@ export class VkScraper {
           });
 
           // Вложенная ветка ответов (threads)
-          if (options.includeReplies && item.thread && item.thread.count > 0 && item.thread.items) {
-            for (const reply of item.thread.items) {
+          if (options.includeReplies && item.thread && item.thread.count > 0) {
+            const threadComments: any[] = [];
+            if (item.thread.items && item.thread.items.length > 0) {
+              threadComments.push(...item.thread.items);
+            }
+
+            // Если в ветке больше комментариев, чем вернулось в превью (или превью не вернуло)
+            let threadOffset = threadComments.length;
+            while (threadOffset < item.thread.count) {
+              const threadResponse = await vkLimiter.execute(
+                () =>
+                  vk.api.wall.getComments({
+                    owner_id: target.ownerId,
+                    post_id: target.itemId,
+                    comment_id: item.id,
+                    offset: threadOffset,
+                    count: 100,
+                    extended: 1,
+                    fields: ['screen_name', 'first_name', 'last_name'],
+                    need_likes: 0,
+                  }),
+                `wall.getComments thread ${item.id} (offset ${threadOffset})`
+              );
+
+              for (const p of threadResponse.profiles || []) {
+                profilesMap.set(p.id, `${p.first_name} ${p.last_name}`);
+              }
+              for (const g of threadResponse.groups || []) {
+                profilesMap.set(-g.id, g.name || 'Сообщество');
+              }
+
+              if (!threadResponse.items || threadResponse.items.length === 0) {
+                break;
+              }
+
+              threadComments.push(...threadResponse.items);
+              threadOffset += threadResponse.items.length;
+            }
+
+            for (const reply of threadComments) {
+              if (reply.deleted) continue;
+
               const replyFromId = reply.from_id;
               const replyAuthorName = profilesMap.get(replyFromId) || `ID ${replyFromId}`;
-              const replyUrl = replyFromId > 0 ? `https://vk.com/id${replyFromId}` : `https://vk.com/club${Math.abs(replyFromId)}`;
+              const replyUrl =
+                replyFromId > 0
+                  ? `https://vk.com/id${replyFromId}`
+                  : `https://vk.com/club${Math.abs(replyFromId)}`;
 
               comments.push({
                 userId: String(replyFromId),

@@ -155,7 +155,7 @@ export function createBot(): Bot {
       url: text,
       platform,
       mode: 'first_wins',
-      includeReplies: false,
+      includeReplies: true, // По умолчанию: собирать 100% комментариев, включая ветки
       keywords: undefined,
       keywordMatchType: 'exact',
     };
@@ -180,7 +180,7 @@ export function createBot(): Bot {
         : '<b>Дисквалификация нарушителей</b>';
 
     const repliesLabel = session.includeReplies
-      ? '<b>Включая ответы в ветках</b>'
+      ? '<b>Включая ветки (все 100% комментов)</b>'
       : '<b>Только основные комменты (без веток)</b>';
 
     let keywordDesc = 'Все комментарии (без фильтрации по словам)';
@@ -212,7 +212,7 @@ export function createBot(): Bot {
       )
       .row()
       .text(
-        session.includeReplies ? '💬 Включая ответы в ветках' : '❌ Только основные (без веток)',
+        session.includeReplies ? '💬 Включая ветки (все комменты)' : '❌ Только основные (без веток)',
         'toggle_replies'
       )
       .row()
@@ -310,7 +310,9 @@ export function createBot(): Bot {
     session.includeReplies = !session.includeReplies;
     await safeAnswerCallback(
       ctx,
-      session.includeReplies ? 'Ответы в ветках: Включены' : 'Ответы в ветках: Отключены'
+      session.includeReplies
+        ? 'Ветки: Включены (собираем все 100% комментов)'
+        : 'Ветки: Отключены (только основные)'
     );
     await updateSettingsMessage(ctx, session);
   });
@@ -322,7 +324,7 @@ export function createBot(): Bot {
         : '<b>Дисквалификация нарушителей</b>';
 
     const repliesLabel = session.includeReplies
-      ? '<b>Включая ответы в ветках</b>'
+      ? '<b>Включая ветки (все 100% комментов)</b>'
       : '<b>Только основные комменты (без веток)</b>';
 
     let keywordDesc = 'Все комментарии (без фильтрации по словам)';
@@ -354,7 +356,7 @@ export function createBot(): Bot {
       )
       .row()
       .text(
-        session.includeReplies ? '💬 Включая ответы в ветках' : '❌ Только основные (без веток)',
+        session.includeReplies ? '💬 Включая ветки (все комменты)' : '❌ Только основные (без веток)',
         'toggle_replies'
       )
       .row()
