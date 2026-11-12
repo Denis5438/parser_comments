@@ -24,6 +24,7 @@ interface UserSession {
   awaitingKeywordInput?: boolean;
   lastResult?: DeduplicationResult;
   lastReportPath?: string;
+  isScraping?: boolean;
 }
 
 const sessions = new Map<number, UserSession>();
@@ -403,29 +404,42 @@ export function createBot(): Bot {
       return;
     }
 
-    await safeAnswerCallback(ctx);
+    if (session.isScraping) {
+      await safeAnswerCallback(
+        ctx,
+        '⚠️ Сбор комментариев уже запущен! Пожалуйста, дождитесь окончания процесса.'
+      );
+      return;
+    }
 
-    const statusMsg = await ctx.reply('⏳ <b>Инициализация подключения к платформе...</b>', {
-      parse_mode: 'HTML',
-    });
+    // 🔒 Синхронная установка блокировки сессии ДО любых асинхронных вызовов (устранение TOCTOU)
+    session.isScraping = true;
 
-    let lastProgressUpdate = 0;
-    const onProgress = async (count: number) => {
-      const now = Date.now();
-      if (now - lastProgressUpdate > 2500) {
-        lastProgressUpdate = now;
-        try {
-          await ctx.api.editMessageText(
-            ctx.chat!.id,
-            statusMsg.message_id,
-            `⏳ <b>Выполняется сбор комментариев...</b>\nСобрано: <b>${count}</b> шт.`,
-            { parse_mode: 'HTML' }
-          );
-        } catch {}
-      }
-    };
+    let statusMsg: any = null;
 
     try {
+      await safeAnswerCallback(ctx);
+
+      statusMsg = await ctx.reply('⏳ <b>Инициализация подключения к платформе...</b>', {
+        parse_mode: 'HTML',
+      });
+
+      let lastProgressUpdate = 0;
+      const onProgress = async (count: number) => {
+        const now = Date.now();
+        if (now - lastProgressUpdate > 2500 && statusMsg) {
+          lastProgressUpdate = now;
+          try {
+            await ctx.api.editMessageText(
+              ctx.chat!.id,
+              statusMsg.message_id,
+              `⏳ <b>Выполняется сбор комментариев...</b>\nСобрано: <b>${count}</b> шт.`,
+              { parse_mode: 'HTML' }
+            );
+          } catch {}
+        }
+      };
+
       let rawComments: RawComment[] = [];
 
       console.log(`[BOT] Старт сбора: URL=${session.url}, платформа=${session.platform}`);
@@ -536,16 +550,41 @@ export function createBot(): Bot {
       });
 
       try {
-        await ctx.api.deleteMessage(ctx.chat!.id, statusMsg.message_id);
+        if (statusMsg && ctx.chat) {
+          await ctx.api.deleteMessage(ctx.chat.id, statusMsg.message_id);
+        }
       } catch {}
     } catch (error: any) {
       console.error('Ошибка при обработке:', error);
-      await ctx.api.editMessageText(
-        ctx.chat!.id,
-        statusMsg.message_id,
-        `❌ <b>Произошла ошибка:</b>\n${error?.message || error}`,
-        { parse_mode: 'HTML' }
-      );
+      const errorCode = (error as any)?.code || (error as any)?.error_code;
+      let errorMessage = '❌ Произошла ошибка при сборе данных. Попробуйте позже или проверьте ссылку.';
+
+      if (errorCode === 29 || errorCode === 'RATE_LIMIT' || error?.message?.includes('Rate limit reached')) {
+        errorMessage = '⚠️ <b>Лимит запросов к VK API исчерпан</b> на сегодня. Платформа VK временно ограничивает выгрузку. Пожалуйста, повторите сбор завтра.';
+      } else if (errorCode === 15 || errorCode === 'ACCESS_DENIED') {
+        errorMessage = '🔒 <b>Ошибка доступа</b>: запись или сообщество закрыто, либо доступ к комментариям ограничен.';
+      } else if (errorCode === 212 || errorCode === 'ACCESS_TO_COMMENTS_DENIED') {
+        errorMessage = '🚫 <b>Комментарии отключены</b> автором к этой публикации.';
+      } else if (error?.message) {
+        errorMessage += `\n\n<i>Детали: ${error.message}</i>`;
+      }
+
+      if (statusMsg && ctx.chat) {
+        try {
+          await ctx.api.editMessageText(
+            ctx.chat.id,
+            statusMsg.message_id,
+            errorMessage,
+            { parse_mode: 'HTML' }
+          );
+        } catch {
+          await ctx.reply(errorMessage, { parse_mode: 'HTML' });
+        }
+      } else {
+        await ctx.reply(errorMessage, { parse_mode: 'HTML' });
+      }
+    } finally {
+      session.isScraping = false;
     }
   });
 

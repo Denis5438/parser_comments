@@ -1,6 +1,7 @@
 import { createBot } from './bot.js';
 import { validateConfig, config } from './config.js';
 import { startHealthServer, stopHealthServer } from './services/healthServer.js';
+import { startCleanupJob, stopCleanupJob } from './services/cleanupService.js';
 
 async function bootstrap() {
   console.log('--------------------------------------------------');
@@ -21,6 +22,9 @@ async function bootstrap() {
   // Стартует до bot.start(), чтобы Render сразу получил бинд на порт.
   const healthServer = startHealthServer(config.port);
 
+  // Запуск службы автоматической периодической очистки Excel-файлов
+  startCleanupJob();
+
   const bot = createBot();
 
   // Обработка мягкой остановки процесса (graceful shutdown)
@@ -30,6 +34,7 @@ async function bootstrap() {
     isShuttingDown = true;
     console.log(`\nПолучен сигнал ${signal}. Остановка бота...`);
     try {
+      stopCleanupJob();
       await stopHealthServer(healthServer);
       await bot.stop();
       console.log('Бот успешно остановлен.');

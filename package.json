@@ -9,7 +9,7 @@
     "dev": "tsx watch src/index.ts",
     "build": "tsc",
     "postinstall": "npm run build",
-    "test": "tsx test/deduplication.test.ts && tsx test/excel.test.ts && tsx test/health.test.ts"
+    "test": "tsx test/deduplication.test.ts && tsx test/excel.test.ts && tsx test/health.test.ts && tsx test/cleanup.test.ts && tsx test/vkLimiter.test.ts"
   },
   "keywords": [
     "telegram-bot",

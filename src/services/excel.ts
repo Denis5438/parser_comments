@@ -2,6 +2,7 @@ import ExcelJS from 'exceljs';
 import path from 'path';
 import fs from 'fs/promises';
 import { DeduplicationResult } from '../types.js';
+import { config } from '../config.js';
 
 export class ExcelService {
   /**
@@ -166,7 +167,7 @@ export class ExcelService {
       });
     }
 
-    const outputDir = path.resolve(process.cwd(), 'output');
+    const outputDir = config.downloadsDir;
     await fs.mkdir(outputDir, { recursive: true });
 
     const timestamp = new Date().toISOString().replace(/[:.]/g, '-');

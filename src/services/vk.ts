@@ -1,6 +1,23 @@
 import { VK } from 'vk-io';
 import { RawComment, ScrapingOptions } from '../types.js';
 import { config } from '../config.js';
+import { vkLimiter } from './vkLimiter.js';
+
+// Shared singleton VK client
+let sharedVkClient: VK | null = null;
+export function getVkClient(): VK {
+  if (!sharedVkClient) {
+    sharedVkClient = new VK({
+      token: config.vkServiceToken,
+      apiLimit: 2.5,
+      apiMode: 'sequential',
+      apiRequestMode: 'sequential',
+      apiRetryLimit: 5,
+      apiWait: 2000,
+    });
+  }
+  return sharedVkClient;
+}
 
 export class VkScraper {
   /**
@@ -57,9 +74,7 @@ export class VkScraper {
       );
     }
 
-    const vk = new VK({
-      token: config.vkServiceToken,
-    });
+    const vk = getVkClient();
 
     const comments: RawComment[] = [];
     let offset = 0;
@@ -68,15 +83,19 @@ export class VkScraper {
 
     while (offset < totalCount) {
       if (target.type === 'wall') {
-        const response = await vk.api.wall.getComments({
-          owner_id: target.ownerId,
-          post_id: target.itemId,
-          offset,
-          count,
-          extended: 1,
-          fields: ['screen_name', 'first_name', 'last_name'],
-          need_likes: 0,
-        });
+        const response = await vkLimiter.execute(
+          () =>
+            vk.api.wall.getComments({
+              owner_id: target.ownerId,
+              post_id: target.itemId,
+              offset,
+              count,
+              extended: 1,
+              fields: ['screen_name', 'first_name', 'last_name'],
+              need_likes: 0,
+            }),
+          `wall.getComments (offset ${offset})`
+        );
 
         totalCount = response.count;
         const profilesMap = new Map<number, string>();
@@ -126,14 +145,18 @@ export class VkScraper {
         }
       } else {
         // target.type === 'video'
-        const response = await vk.api.video.getComments({
-          owner_id: target.ownerId,
-          video_id: target.itemId,
-          offset,
-          count,
-          extended: 1,
-          need_likes: 0,
-        });
+        const response = await vkLimiter.execute(
+          () =>
+            vk.api.video.getComments({
+              owner_id: target.ownerId,
+              video_id: target.itemId,
+              offset,
+              count,
+              extended: 1,
+              need_likes: 0,
+            }),
+          `video.getComments (offset ${offset})`
+        );
 
         totalCount = response.count;
         const profilesMap = new Map<number, string>();
