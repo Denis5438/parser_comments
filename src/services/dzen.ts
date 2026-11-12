@@ -166,47 +166,71 @@ export class DzenScraper {
             const commentMeta = metaByCommentId[String(ed.id)] || metaByCommentId[ed.id];
             if (commentMeta && commentMeta.childrenCount > 0) {
               try {
-                const childRes = await axios.get('https://dzen.ru/api/comments/v2/child-comments', {
-                  params: {
+                let childFetchAfter: string | number | null = null;
+                let hasMoreChild = true;
+
+                while (hasMoreChild) {
+                  const childParams: Record<string, string | number> = {
                     rootCommentId: ed.id,
                     documentId,
-                    ...(publicationPublisherId ? { publicationPublisherId } : {}),
-                  },
-                  headers: {
-                    ...this.apiHeaders,
-                    Referer: url,
-                  },
-                  timeout: 10000,
-                });
+                    batchSize: 50,
+                  };
+                  if (publicationPublisherId) {
+                    childParams.publicationPublisherId = publicationPublisherId;
+                  }
+                  if (childFetchAfter) {
+                    childParams.fetchAfterCommentId = childFetchAfter;
+                  }
 
-                const childItems = childRes.data?.items || [];
-                const childUsers = childRes.data?.usersById || {};
-
-                for (const child of childItems) {
-                  const ced = child.entityData;
-                  if (!ced) continue;
-
-                  const cUserKey = String(ced.authorSafeUid || ced.authorUid);
-                  const cUser = childUsers[cUserKey] || childUsers[String(ced.authorUid)] || {};
-                  const cUsername =
-                    cUser.displayName || cUser.name || (cUser.publisher ? cUser.publisher.name : '') || 'Пользователь Дзен';
-                  const cProfileUrl = cUser.publicId
-                    ? `https://dzen.ru/user/${cUser.publicId}`
-                    : cUser.publisher?.channelPath
-                    ? `https://dzen.ru${cUser.publisher.channelPath}`
-                    : cUser.publisher?.id
-                    ? `https://dzen.ru/id/${cUser.publisher.id}`
-                    : '';
-
-                  comments.push({
-                    userId: String(ced.authorSafeUid || ced.authorUid || ced.id),
-                    username: cUsername,
-                    profileUrl: cProfileUrl,
-                    commentText: ced.text || '',
-                    createdAt: new Date(ced.createdTs || Date.now()),
-                    commentId: String(ced.id),
-                    isReply: true,
+                  const childRes = await axios.get('https://dzen.ru/api/comments/v2/child-comments', {
+                    params: childParams,
+                    headers: {
+                      ...this.apiHeaders,
+                      Referer: url,
+                    },
+                    timeout: 10000,
                   });
+
+                  const childItems = childRes.data?.items || [];
+                  const childUsers = childRes.data?.usersById || {};
+
+                  if (!Array.isArray(childItems) || childItems.length === 0) {
+                    hasMoreChild = false;
+                    break;
+                  }
+
+                  for (const child of childItems) {
+                    const ced = child.entityData;
+                    if (!ced) continue;
+
+                    const cUserKey = String(ced.authorSafeUid || ced.authorUid);
+                    const cUser = childUsers[cUserKey] || childUsers[String(ced.authorUid)] || {};
+                    const cUsername =
+                      cUser.displayName || cUser.name || (cUser.publisher ? cUser.publisher.name : '') || 'Пользователь Дзен';
+                    const cProfileUrl = cUser.publicId
+                      ? `https://dzen.ru/user/${cUser.publicId}`
+                      : cUser.publisher?.channelPath
+                      ? `https://dzen.ru${cUser.publisher.channelPath}`
+                      : cUser.publisher?.id
+                      ? `https://dzen.ru/id/${cUser.publisher.id}`
+                      : '';
+
+                    comments.push({
+                      userId: String(ced.authorSafeUid || ced.authorUid || ced.id),
+                      username: cUsername,
+                      profileUrl: cProfileUrl,
+                      commentText: ced.text || '',
+                      createdAt: new Date(ced.createdTs || Date.now()),
+                      commentId: String(ced.id),
+                      isReply: true,
+                    });
+                  }
+
+                  const lastChild = childItems[childItems.length - 1];
+                  childFetchAfter = lastChild?.entityData?.id;
+                  if (childItems.length < 50 || !childFetchAfter) {
+                    hasMoreChild = false;
+                  }
                 }
               } catch (childErr) {
                 console.warn(`[DZEN] Не удалось загрузить ветку ответов для комментария ${ed.id}:`, childErr);

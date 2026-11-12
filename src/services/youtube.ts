@@ -191,8 +191,12 @@ export class YouTubeScraper {
               });
 
               // Вложенные ответы в ветках
-              if (options.includeReplies && thread.replies?.commentRepliesRenderer?.contents) {
-                for (const replyItem of thread.replies.commentRepliesRenderer.contents) {
+              if (options.includeReplies && thread.replies?.commentRepliesRenderer) {
+                const renderer = thread.replies.commentRepliesRenderer;
+                const contents = renderer.contents || [];
+                let replyContinuation: string | null = null;
+
+                for (const replyItem of contents) {
                   const reply = replyItem.commentRenderer;
                   if (reply) {
                     const rAuthor =
@@ -219,6 +223,84 @@ export class YouTubeScraper {
                       commentId: reply.commentId || undefined,
                       isReply: true,
                     });
+                  }
+
+                  const token =
+                    replyItem.continuationItemRenderer?.continuationEndpoint?.continuationCommand?.token;
+                  if (token) {
+                    replyContinuation = token;
+                  }
+                }
+
+                // Догружаем глубокие ветки ответов YouTube при наличии токена продолжения
+                while (replyContinuation) {
+                  try {
+                    const replyNextUrl = `https://www.youtube.com/youtubei/v1/next?key=${innertubeKey}`;
+                    const replyRes: any = await axios.post(
+                      replyNextUrl,
+                      {
+                        context: {
+                          client: {
+                            clientName: 'MWEB',
+                            clientVersion: '2.20240101.01.00',
+                            hl: 'ru',
+                            gl: 'RU',
+                          },
+                        },
+                        continuation: replyContinuation,
+                      },
+                      {
+                        headers: this.mwebHeaders,
+                        timeout: 15000,
+                      }
+                    );
+
+                    replyContinuation = null;
+                    const rEndpoints: any[] = replyRes.data?.onResponseReceivedEndpoints || [];
+                    for (const rEp of rEndpoints) {
+                      const rCmd =
+                        rEp.appendContinuationItemsAction || rEp.reloadContinuationItemsCommand;
+                      if (!rCmd) continue;
+
+                      for (const rIt of rCmd.continuationItems || []) {
+                        const rRenderer = rIt.commentRenderer;
+                        if (rRenderer) {
+                          const rAuthor =
+                            rRenderer.authorText?.runs?.map((r: any) => r.text).join('') ||
+                            rRenderer.authorText?.simpleText ||
+                            'Аноним';
+                          const rText =
+                            rRenderer.contentText?.runs?.map((r: any) => r.text).join('') ||
+                            rRenderer.contentText?.simpleText ||
+                            '';
+                          const rChannelId =
+                            rRenderer.authorEndpoint?.browseEndpoint?.browseId || 'unknown_user';
+                          const rCanonicalUrl =
+                            rRenderer.authorEndpoint?.browseEndpoint?.canonicalBaseUrl;
+                          const rProfileUrl = rCanonicalUrl
+                            ? `https://www.youtube.com${rCanonicalUrl}`
+                            : `https://www.youtube.com/channel/${rChannelId}`;
+
+                          comments.push({
+                            userId: rChannelId,
+                            username: rAuthor,
+                            profileUrl: rProfileUrl,
+                            commentText: rText,
+                            createdAt: new Date(),
+                            commentId: rRenderer.commentId || undefined,
+                            isReply: true,
+                          });
+                        }
+
+                        const nextRToken =
+                          rIt.continuationItemRenderer?.continuationEndpoint?.continuationCommand?.token;
+                        if (nextRToken) {
+                          replyContinuation = nextRToken;
+                        }
+                      }
+                    }
+                  } catch {
+                    break;
                   }
                 }
               }
@@ -289,10 +371,14 @@ export class YouTubeScraper {
           });
         }
 
-        if (options.includeReplies && item.replies?.comments) {
-          for (const reply of item.replies.comments) {
+        if (options.includeReplies && (item.snippet?.totalReplyCount || 0) > 0) {
+          const loadedReplies = item.replies?.comments || [];
+          const existingIds = new Set<string>();
+
+          for (const reply of loadedReplies) {
             const replySnippet = reply.snippet;
             if (replySnippet) {
+              if (reply.id) existingIds.add(reply.id);
               const replyAuthorId =
                 replySnippet.authorChannelId?.value ||
                 replySnippet.authorDisplayName ||
@@ -312,6 +398,53 @@ export class YouTubeScraper {
                 isReply: true,
               });
             }
+          }
+
+          // Если в превью вернулись не все ответы ветки — докачиваем через comments.list
+          if (item.snippet.totalReplyCount > loadedReplies.length) {
+            let replyPageToken: string | undefined = undefined;
+            do {
+              try {
+                const repliesRes: any = await youtube.comments.list({
+                  part: ['snippet'],
+                  parentId: item.id,
+                  maxResults: 100,
+                  pageToken: replyPageToken,
+                  textFormat: 'plainText',
+                });
+
+                for (const r of repliesRes.data?.items || []) {
+                  if (r.id && existingIds.has(r.id)) continue;
+                  if (r.id) existingIds.add(r.id);
+
+                  const rSnippet = r.snippet;
+                  if (rSnippet) {
+                    const rAuthorId =
+                      rSnippet.authorChannelId?.value ||
+                      rSnippet.authorDisplayName ||
+                      'unknown';
+
+                    comments.push({
+                      userId: rAuthorId,
+                      username: rSnippet.authorDisplayName || 'Аноним',
+                      profileUrl:
+                        rSnippet.authorChannelUrl ||
+                        (rAuthorId !== 'unknown'
+                          ? `https://www.youtube.com/channel/${rAuthorId}`
+                          : ''),
+                      commentText: rSnippet.textDisplay || rSnippet.textOriginal || '',
+                      createdAt: new Date(rSnippet.publishedAt || Date.now()),
+                      commentId: r.id || undefined,
+                      isReply: true,
+                    });
+                  }
+                }
+
+                replyPageToken = repliesRes.data?.nextPageToken || undefined;
+              } catch {
+                break;
+              }
+            } while (replyPageToken);
           }
         }
       }
