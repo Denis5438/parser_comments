@@ -32,8 +32,12 @@ export class CleanupService {
         ]
       )
     );
-    this.maxAgeMs = options?.maxAgeMs ?? config.excelMaxAgeMinutes * 60 * 1000;
-    this.intervalMs = options?.intervalMs ?? config.cleanupIntervalMinutes * 60 * 1000;
+    // Defect 5.6: Guard against 0 / NaN / negative config values
+    const rawMaxAge = options?.maxAgeMs ?? config.excelMaxAgeMinutes * 60 * 1000;
+    this.maxAgeMs = Number.isFinite(rawMaxAge) && rawMaxAge > 0 ? rawMaxAge : 30 * 60 * 1000;
+
+    const rawInterval = options?.intervalMs ?? config.cleanupIntervalMinutes * 60 * 1000;
+    this.intervalMs = Number.isFinite(rawInterval) && rawInterval > 0 ? rawInterval : 15 * 60 * 1000;
   }
 
   /**
@@ -135,8 +139,9 @@ export class CleanupService {
         }
 
         for (const file of entries) {
-          // Удаляем только Excel-файлы и временные выгрузки
-          if (!file.toLowerCase().endsWith('.xlsx') && !file.toLowerCase().endsWith('.tmp')) {
+          const lower = file.toLowerCase();
+          // Defect 5.4: Only delete files starting with giveaway_ and ending with .xlsx or .tmp
+          if (!lower.startsWith('giveaway_') || (!lower.endsWith('.xlsx') && !lower.endsWith('.tmp'))) {
             continue;
           }
 

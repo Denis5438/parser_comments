@@ -9,13 +9,45 @@ import {
 
 export class DeduplicationService {
   /**
-   * Очищает строку от концевых и начальных знаков препинания и пробелов
+   * Очищает строку от концевых и начальных знаков препинания, кавычек, многоточий и пробелов
+   * Поддерживает Unicode нормализацию (NFC) и замену буквы ё -> е (Defect 4.1 & 4.2)
    */
   public cleanText(text: string): string {
+    if (!text || typeof text !== 'string') return '';
     return text
+      .normalize('NFC')
+      .replace(/ё/g, 'е')
+      .replace(/Ё/g, 'е')
+      .replace(/[\u200B-\u200D\uFEFF]/g, '')
       .trim()
-      .replace(/^[\s!?,.:;«»"'—–\(\)\[\]{}#*~`]+|[\s!?,.:;«»"'—–\(\)\[\]{}#*~`]+$/gu, '')
+      .replace(
+        /^[\s!?,.:;«»"“”‘’'—–\-\u2212…/\\()\[\]{}#*~`]+|[\s!?,.:;«»"“”‘’'—–\-\u2212…/\\()\[\]{}#*~`]+$/gu,
+        ''
+      )
+      .replace(/\s+/g, ' ')
       .toLowerCase();
+  }
+
+  /**
+   * Нормализует произвольный текст комментария для поиска (NFC, ё -> е, lowercase)
+   */
+  private normalizeForSearch(text: string): string {
+    if (!text || typeof text !== 'string') return '';
+    return text
+      .normalize('NFC')
+      .replace(/ё/g, 'е')
+      .replace(/Ё/g, 'е')
+      .replace(/[\u200B-\u200D\uFEFF]/g, '')
+      .toLowerCase();
+  }
+
+  /**
+   * Проверяет вхождение ключевого слова с учетом честных границ слов (Unicode word boundaries)
+   */
+  private matchesWordBoundary(text: string, cleanKeyword: string): boolean {
+    const escapedWord = cleanKeyword.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+    const regex = new RegExp(`(^|[^\\p{L}\\p{N}])${escapedWord}([^\\p{L}\\p{N}]|$)`, 'u');
+    return regex.test(text);
   }
 
   /**
@@ -73,8 +105,8 @@ export class DeduplicationService {
           if (eligibleComments.length === 0) {
             // Проверяем, встречалось ли хоть одно слово среди другого текста
             const containsAny = userComments.some((c) => {
-              const lower = c.commentText.toLowerCase();
-              return cleanKeywords.some((k) => lower.includes(k));
+              const normalized = this.normalizeForSearch(c.commentText);
+              return cleanKeywords.some((k) => this.matchesWordBoundary(normalized, k));
             });
 
             const reason = containsAny
@@ -95,10 +127,10 @@ export class DeduplicationService {
             continue;
           }
         } else {
-          // Мягкий режим: любое из слов списка может быть в любом месте текста
+          // Мягкий режим: любое из слов списка может быть в любом месте текста с учетом границ слов
           eligibleComments = userComments.filter((c) => {
-            const lower = c.commentText.toLowerCase();
-            return cleanKeywords.some((k) => lower.includes(k));
+            const normalized = this.normalizeForSearch(c.commentText);
+            return cleanKeywords.some((k) => this.matchesWordBoundary(normalized, k));
           });
 
           if (eligibleComments.length === 0) {

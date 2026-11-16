@@ -3,6 +3,14 @@ import { validateConfig, config } from './config.js';
 import { startHealthServer, stopHealthServer } from './services/healthServer.js';
 import { startCleanupJob, stopCleanupJob } from './services/cleanupService.js';
 
+// Глобальные перехватчики ошибок для предотвращения падения процесса (Defect 3.2)
+process.on('unhandledRejection', (reason, promise) => {
+  console.error('⚠️ [Process] Unhandled Rejection at:', promise, 'reason:', reason);
+});
+process.on('uncaughtException', (error) => {
+  console.error('⚠️ [Process] Uncaught Exception:', error);
+});
+
 async function bootstrap() {
   console.log('--------------------------------------------------');
   console.log('🚀 Запуск бота для розыгрышей (Giveaway Contest Bot)...');
@@ -19,8 +27,8 @@ async function bootstrap() {
   }
 
   // Запуск HTTP health-сервера (нужен для Render + UptimeRobot).
-  // Стартует до bot.start(), чтобы Render сразу получил бинд на порт.
-  const healthServer = startHealthServer(config.port);
+  // Стартует до bot.start(), чтобы Render сразу получил бинд на порт (Defect 3.1).
+  const healthServer = await startHealthServer(config.port);
 
   // Запуск службы автоматической периодической очистки Excel-файлов
   startCleanupJob();

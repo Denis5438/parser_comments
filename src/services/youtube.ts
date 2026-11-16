@@ -3,6 +3,38 @@ import { google } from 'googleapis';
 import { RawComment, ScrapingOptions } from '../types.js';
 import { config } from '../config.js';
 
+export function parseCommentDate(timestampUsec?: string, publishedTimeText?: string): Date {
+  if (timestampUsec) {
+    const ms = Math.floor(parseInt(timestampUsec, 10) / 1000);
+    if (!isNaN(ms) && ms > 0) {
+      return new Date(ms);
+    }
+  }
+  if (!publishedTimeText) {
+    return new Date();
+  }
+  const lower = publishedTimeText.toLowerCase().trim();
+  const match = lower.match(/(\d+)\s*([а-яa-z]+)/);
+  if (match) {
+    const num = parseInt(match[1], 10);
+    const unit = match[2];
+    const now = Date.now();
+    let diffMs = 0;
+    if (unit.startsWith('сек') || unit.startsWith('sec')) diffMs = num * 1000;
+    else if (unit.startsWith('мин') || unit.startsWith('min')) diffMs = num * 60 * 1000;
+    else if (unit.startsWith('час') || unit.startsWith('hour') || unit.startsWith('hr')) diffMs = num * 3600 * 1000;
+    else if (unit.startsWith('ден') || unit.startsWith('дня') || unit.startsWith('дне') || unit.startsWith('day')) diffMs = num * 86400 * 1000;
+    else if (unit.startsWith('нед') || unit.startsWith('week')) diffMs = num * 7 * 86400 * 1000;
+    else if (unit.startsWith('мес') || unit.startsWith('month')) diffMs = num * 30 * 86400 * 1000;
+    else if (unit.startsWith('год') || unit.startsWith('лет') || unit.startsWith('year') || unit.startsWith('yr')) diffMs = num * 365 * 86400 * 1000;
+
+    if (diffMs > 0) {
+      return new Date(now - diffMs);
+    }
+  }
+  return new Date();
+}
+
 export class YouTubeScraper {
   private readonly browserHeaders = {
     'User-Agent':
@@ -30,7 +62,8 @@ export class YouTubeScraper {
         return parsed.pathname.slice(1).split('?')[0];
       }
       if (parsed.pathname.includes('/shorts/')) {
-        return parsed.pathname.split('/shorts/')[1].split('?')[0];
+        const afterShorts = parsed.pathname.split('/shorts/')[1];
+        return afterShorts.split('/')[0].split('?')[0];
       }
       if (parsed.pathname.includes('/live/')) {
         return parsed.pathname.split('/live/')[1].split('?')[0];
@@ -113,8 +146,17 @@ export class YouTubeScraper {
 
     const comments: RawComment[] = [];
     let hasMore = true;
+    const seenTokens = new Set<string>();
+    let retryCount = 0;
+    const MAX_PAGE_RETRIES = 3;
 
     while (hasMore && continuationToken) {
+      if (seenTokens.has(continuationToken)) {
+        console.warn(`[YouTube] Повторный continuation token: обнаружен цикл пагинации, завершение.`);
+        break;
+      }
+      seenTokens.add(continuationToken);
+
       try {
         const nextUrl = `https://www.youtube.com/youtubei/v1/next?key=${innertubeKey}`;
         const res: any = await axios.post(
@@ -135,6 +177,8 @@ export class YouTubeScraper {
             timeout: 15000,
           }
         );
+
+        retryCount = 0;
 
         const endpoints: any[] = res.data?.onResponseReceivedEndpoints || [];
         let foundInBatch = 0;
@@ -180,12 +224,17 @@ export class YouTubeScraper {
                 ? `https://www.youtube.com${canonicalUrl}`
                 : `https://www.youtube.com/channel/${channelId}`;
 
+              const commentDate = parseCommentDate(
+                c.timestampUsec,
+                c.publishedTimeText?.runs?.[0]?.text || c.publishedTimeText?.simpleText
+              );
+
               comments.push({
                 userId: channelId,
                 username: author,
                 profileUrl,
                 commentText: text,
-                createdAt: new Date(),
+                createdAt: commentDate,
                 commentId: c.commentId || undefined,
                 isReply: false,
               });
@@ -214,12 +263,17 @@ export class YouTubeScraper {
                       ? `https://www.youtube.com${rCanonicalUrl}`
                       : `https://www.youtube.com/channel/${rChannelId}`;
 
+                    const rDate = parseCommentDate(
+                      reply.timestampUsec,
+                      reply.publishedTimeText?.runs?.[0]?.text || reply.publishedTimeText?.simpleText
+                    );
+
                     comments.push({
                       userId: rChannelId,
                       username: rAuthor,
                       profileUrl: rProfileUrl,
                       commentText: rText,
-                      createdAt: new Date(),
+                      createdAt: rDate,
                       commentId: reply.commentId || undefined,
                       isReply: true,
                     });
@@ -281,12 +335,17 @@ export class YouTubeScraper {
                             ? `https://www.youtube.com${rCanonicalUrl}`
                             : `https://www.youtube.com/channel/${rChannelId}`;
 
+                          const deepDate = parseCommentDate(
+                            rRenderer.timestampUsec,
+                            rRenderer.publishedTimeText?.runs?.[0]?.text || rRenderer.publishedTimeText?.simpleText
+                          );
+
                           comments.push({
                             userId: rChannelId,
                             username: rAuthor,
                             profileUrl: rProfileUrl,
                             commentText: rText,
-                            createdAt: new Date(),
+                            createdAt: deepDate,
                             commentId: rRenderer.commentId || undefined,
                             isReply: true,
                           });
@@ -313,14 +372,23 @@ export class YouTubeScraper {
         }
 
         continuationToken = nextContinuation;
-        if (!continuationToken || foundInBatch === 0) {
+        if (!continuationToken) {
           hasMore = false;
         }
       } catch (err: any) {
-        if (comments.length > 0) {
-          break;
+        if (retryCount < MAX_PAGE_RETRIES) {
+          retryCount++;
+          const backoff = 1500 * Math.pow(2, retryCount - 1);
+          console.warn(
+            `[YouTube] Сетевая ошибка при получении страницы комментариев (${err?.message || err}). Повтор ${retryCount}/${MAX_PAGE_RETRIES} через ${backoff}мс...`
+          );
+          await new Promise((resolve) => setTimeout(resolve, backoff));
+          continue;
         }
-        throw new Error(`Ошибка при выгрузке комментариев YouTube: ${err?.message || err}`);
+
+        throw new Error(
+          `Сбор комментариев YouTube прерван из-за сетевой ошибки после ${MAX_PAGE_RETRIES} попыток: ${err?.message || err}. Собрано ${comments.length} шт.`
+        );
       }
     }
 

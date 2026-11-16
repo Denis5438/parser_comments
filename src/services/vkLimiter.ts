@@ -166,9 +166,14 @@ export class VkRateLimiter {
 
     // Ошибки VK API
     const code = error.code || error.error_code;
+    if (code === 1 || code === 'UNKNOWN_ERROR') return true; // Unknown error occurred (transient)
     if (code === 6 || code === 'TOO_MANY') return true; // Слишком много запросов в секунду
     if (code === 9 || code === 'FLOOD') return true;    // Flood control
     if (code === 10 || code === 'INTERNAL_ERROR') return true; // Внутренняя ошибка сервера VK
+
+    // HTTP status codes от прокси-балансировщиков VK
+    const httpStatus = error.response?.status || error.statusCode || error.status;
+    if (httpStatus === 502 || httpStatus === 503 || httpStatus === 504) return true;
 
     // Ошибки сети / таймауты
     const errCodeStr = String(code || '').toUpperCase();
@@ -176,7 +181,8 @@ export class VkRateLimiter {
       errCodeStr === 'ETIMEDOUT' ||
       errCodeStr === 'ECONNRESET' ||
       errCodeStr === 'ECONNREFUSED' ||
-      errCodeStr === 'EAI_AGAIN'
+      errCodeStr === 'EAI_AGAIN' ||
+      errCodeStr === 'ENOTFOUND'
     ) {
       return true;
     }
@@ -186,10 +192,13 @@ export class VkRateLimiter {
       message.includes('etimedout') ||
       message.includes('econnreset') ||
       message.includes('econnrefused') ||
+      message.includes('enotfound') ||
+      message.includes('eai_again') ||
       message.includes('socket hang up') ||
       message.includes('network error') ||
       message.includes('gateway timeout') ||
-      message.includes('bad gateway')
+      message.includes('bad gateway') ||
+      message.includes('service unavailable')
     ) {
       return true;
     }
@@ -199,55 +208,68 @@ export class VkRateLimiter {
 
   /**
    * Выполняет асинхронную операцию через рейт-лимитер с сериализацией, circuit breaker и экспоненциальным бэкоффом.
+   * Defect 1.1 fix: release activeRequests in finally BEFORE sleeping for retry,
+   * so concurrency stays strictly <= maxConcurrent.
    */
   public async execute<T>(fn: () => Promise<T>, taskName: string = 'VK API Request'): Promise<T> {
     let attempt = 0;
 
     while (true) {
       await this.acquireToken();
+      let result: T;
+      let hasResult = false;
+      let thrownError: any = null;
+
       this.activeRequests++;
-
       try {
-        return await fn();
+        result = await fn();
+        hasResult = true;
       } catch (error: any) {
-        attempt++;
-
-        const code = error.code || error.error_code;
-
-        // Глобальный circuit breaker: при ошибке 6 (TOO_MANY) замораживаем всю очередь на 1500мс
-        if (code === 6 || code === 'TOO_MANY') {
-          this.pausedUntil = Math.max(this.pausedUntil, Date.now() + this.circuitBreakerPauseMs);
-          console.warn(
-            `[VkRateLimiter] Получена ошибка 6 (TOO_MANY) в "${taskName}". Очередь глобально заморожена на ${this.circuitBreakerPauseMs}мс.`
-          );
-        }
-
-        if (attempt > this.maxRetries || !this.isRetryableError(error)) {
-          console.error(
-            `[VkRateLimiter] Задача "${taskName}" прервана (попытка ${attempt}/${this.maxRetries}). Ошибка:`,
-            error.message || error
-          );
-          throw error;
-        }
-
-        // Экспоненциальный бэкофф с полным джиттером: delay = min(maxDelay, baseDelay * 2^(attempt-1) + jitter)
-        const exponentialDelay = this.baseDelayMs * Math.pow(2, attempt - 1);
-        const jitter = Math.floor(Math.random() * 400);
-        const totalDelay = Math.min(this.maxDelayMs, exponentialDelay + jitter);
-
-        // При ошибке 6 добавляем локальное ожидание
-        const extraWait = code === 6 || code === 'TOO_MANY' ? 1000 : 0;
-        const actualWait = totalDelay + extraWait;
-
-        console.warn(
-          `[VkRateLimiter] Перехвачена ошибка ${code || error.message} в "${taskName}". Повтор ${attempt}/${this.maxRetries} через ${actualWait}мс...`
-        );
-
-        await new Promise((resolve) => setTimeout(resolve, actualWait));
+        thrownError = error;
       } finally {
         this.activeRequests--;
         this.processQueue();
       }
+
+      if (hasResult) {
+        return result!;
+      }
+
+      // Handle the error outside the try/catch/finally so the slot is already released
+      attempt++;
+      const code = thrownError.code || thrownError.error_code;
+
+      // Глобальный circuit breaker: при ошибке 6 (TOO_MANY) замораживаем всю очередь
+      if (code === 6 || code === 'TOO_MANY') {
+        this.pausedUntil = Math.max(this.pausedUntil, Date.now() + this.circuitBreakerPauseMs);
+        console.warn(
+          `[VkRateLimiter] Получена ошибка 6 (TOO_MANY) в "${taskName}". Очередь глобально заморожена на ${this.circuitBreakerPauseMs}мс.`
+        );
+      }
+
+      if (attempt > this.maxRetries || !this.isRetryableError(thrownError)) {
+        console.error(
+          `[VkRateLimiter] Задача "${taskName}" прервана (попытка ${attempt}/${this.maxRetries}). Ошибка:`,
+          thrownError.message || thrownError
+        );
+        throw thrownError;
+      }
+
+      // Экспоненциальный бэкофф с полным джиттером: delay = min(maxDelay, baseDelay * 2^(attempt-1) + jitter)
+      const exponentialDelay = this.baseDelayMs * Math.pow(2, attempt - 1);
+      const jitter = Math.floor(Math.random() * 400);
+      const totalDelay = Math.min(this.maxDelayMs, exponentialDelay + jitter);
+
+      // При ошибке 6 добавляем локальное ожидание
+      const extraWait = code === 6 || code === 'TOO_MANY' ? 1000 : 0;
+      const actualWait = totalDelay + extraWait;
+
+      console.warn(
+        `[VkRateLimiter] Перехвачена ошибка ${code || thrownError.message} в "${taskName}". Повтор ${attempt}/${this.maxRetries} через ${actualWait}мс...`
+      );
+
+      // Sleep AFTER releasing the slot (finally already ran)
+      await new Promise((resolve) => setTimeout(resolve, actualWait));
     }
   }
 }

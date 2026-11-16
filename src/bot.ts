@@ -1,4 +1,5 @@
 import { Bot, InlineKeyboard, InputFile } from 'grammy';
+import crypto from 'node:crypto';
 import { config, validateConfig } from './config.js';
 import {
   Platform,
@@ -14,6 +15,36 @@ import { instagramScraper } from './services/instagram.js';
 import { deduplicator } from './services/deduplicator.js';
 import { excelService } from './services/excel.js';
 
+/** Telegram HTML entity escaping (Defect 2.1) */
+function escapeHtml(str: string): string {
+  if (!str) return '';
+  return str
+    .replace(/&/g, '&amp;')
+    .replace(/</g, '&lt;')
+    .replace(/>/g, '&gt;');
+}
+
+/** Telegram max message length */
+const TELEGRAM_MAX_LENGTH = 4096;
+
+/** Split a message into chunks that fit Telegram's 4096 char limit (Defect 2.2) */
+function splitMessage(text: string, maxLen: number = TELEGRAM_MAX_LENGTH): string[] {
+  if (text.length <= maxLen) return [text];
+  const chunks: string[] = [];
+  let remaining = text;
+  while (remaining.length > 0) {
+    if (remaining.length <= maxLen) {
+      chunks.push(remaining);
+      break;
+    }
+    let splitAt = remaining.lastIndexOf('\n', maxLen);
+    if (splitAt <= 0) splitAt = maxLen;
+    chunks.push(remaining.slice(0, splitAt));
+    remaining = remaining.slice(splitAt);
+  }
+  return chunks;
+}
+
 interface UserSession {
   url: string;
   platform: Platform;
@@ -25,6 +56,7 @@ interface UserSession {
   lastResult?: DeduplicationResult;
   lastReportPath?: string;
   isScraping?: boolean;
+  isPickingWinner?: boolean;
 }
 
 const sessions = new Map<number, UserSession>();
@@ -125,7 +157,7 @@ export function createBot(): Bot {
       } else {
         session.keywords = lines;
         session.keywordMatchType = 'exact'; // По умолчанию строгое совпадение
-        const listFormatted = lines.map((w, i) => `  ${i + 1}. «<b>${w}</b>»`).join('\n');
+        const listFormatted = lines.map((w, i) => `  ${i + 1}. «<b>${escapeHtml(w)}</b>»`).join('\n');
         await ctx.reply(
           `✅ Установлены кодовые слова (${lines.length} шт.):\n${listFormatted}\n\n` +
             `По умолчанию включен режим: <b>«🎯 Строго точное совпадение»</b> (комментарий должен быть равен любому из этих слов без лишнего текста).`,
@@ -150,6 +182,13 @@ export function createBot(): Bot {
     }
 
     console.log(`[BOT] Пользователь @${ctx.from?.username || ctx.from?.id} прислал ссылку: ${text} (${platform})`);
+
+    // Defect 2.3: Prevent overwriting an ongoing session if isScraping is true
+    const existingSession = sessions.get(ctx.chat.id);
+    if (existingSession?.isScraping) {
+      await ctx.reply('⚠️ В данный момент уже выполняется сбор комментариев. Дождитесь его завершения.');
+      return;
+    }
 
     const newSession: UserSession = {
       url: text,
@@ -187,8 +226,8 @@ export function createBot(): Bot {
     if (session.keywords && session.keywords.length > 0) {
       const wordsPreview =
         session.keywords.length <= 3
-          ? session.keywords.map((k) => `«${k}»`).join(', ')
-          : session.keywords.slice(0, 3).map((k) => `«${k}»`).join(', ') + ' и др.';
+          ? session.keywords.map((k) => `«${escapeHtml(k)}»`).join(', ')
+          : session.keywords.slice(0, 3).map((k) => `«${escapeHtml(k)}»`).join(', ') + ' и др.';
 
       keywordDesc =
         session.keywordMatchType === 'exact'
@@ -331,8 +370,8 @@ export function createBot(): Bot {
     if (session.keywords && session.keywords.length > 0) {
       const wordsPreview =
         session.keywords.length <= 3
-          ? session.keywords.map((k) => `«${k}»`).join(', ')
-          : session.keywords.slice(0, 3).map((k) => `«${k}»`).join(', ') + ' и др.';
+          ? session.keywords.map((k) => `«${escapeHtml(k)}»`).join(', ')
+          : session.keywords.slice(0, 3).map((k) => `«${escapeHtml(k)}»`).join(', ') + ' и др.';
 
       keywordDesc =
         session.keywordMatchType === 'exact'
@@ -520,14 +559,16 @@ export function createBot(): Bot {
       });
 
       // 4. Формируем итоговую статистику
+      // Defect 2.2: Truncate keyword list to prevent exceeding Telegram 4096 char limit
       let wordStat = '';
       if (session.keywords && session.keywords.length > 0) {
         const typeStr =
           session.keywordMatchType === 'exact'
             ? 'Строго точные слова'
             : 'В любом месте фразы';
-        const wordsList = session.keywords.map((w) => `«${w}»`).join(', ');
-        wordStat = `• Список кодовых слов (${session.keywords.length} шт.): ${wordsList} (<i>${typeStr}</i>)\n`;
+        const previewWords = session.keywords.slice(0, 5).map((w) => `«${escapeHtml(w)}»`).join(', ');
+        const extraCount = session.keywords.length > 5 ? ` и еще ${session.keywords.length - 5} слов` : '';
+        wordStat = `• Список кодовых слов (${session.keywords.length} шт.): ${previewWords}${extraCount} (<i>${typeStr}</i>)\n`;
       }
 
       const summaryText =
@@ -546,10 +587,15 @@ export function createBot(): Bot {
         'pick_random_winner'
       );
 
-      await ctx.reply(summaryText, {
-        parse_mode: 'HTML',
-        reply_markup: winnerKeyboard,
-      });
+      // Defect 2.2: Split message if it exceeds Telegram's 4096 char limit
+      const summaryChunks = splitMessage(summaryText);
+      for (let i = 0; i < summaryChunks.length; i++) {
+        const isLast = i === summaryChunks.length - 1;
+        await ctx.reply(summaryChunks[i], {
+          parse_mode: 'HTML',
+          ...(isLast ? { reply_markup: winnerKeyboard } : {}),
+        });
+      }
 
       try {
         if (statusMsg && ctx.chat) {
@@ -568,7 +614,7 @@ export function createBot(): Bot {
       } else if (errorCode === 212 || errorCode === 'ACCESS_TO_COMMENTS_DENIED') {
         errorMessage = '🚫 <b>Комментарии отключены</b> автором к этой публикации.';
       } else if (error?.message) {
-        errorMessage += `\n\n<i>Детали: ${error.message}</i>`;
+        errorMessage += `\n\n<i>Детали: ${escapeHtml(error.message)}</i>`;
       }
 
       if (statusMsg && ctx.chat) {
@@ -598,32 +644,48 @@ export function createBot(): Bot {
       return;
     }
 
-    const participants = session.lastResult.participants;
-    const randomIndex = Math.floor(Math.random() * participants.length);
-    const winner = participants[randomIndex];
+    // Defect 2.4: Debounce/locking to prevent double-click race condition
+    if (session.isPickingWinner) {
+      await safeAnswerCallback(ctx, '⏳ Определение победителя уже выполняется...');
+      return;
+    }
+    session.isPickingWinner = true;
 
-    await safeAnswerCallback(ctx, `🎉 Выбран победитель №${winner.number}!`);
+    try {
+      const participants = session.lastResult.participants;
+      // Defect 2.7: Use crypto.randomInt instead of Math.random()
+      const randomIndex = crypto.randomInt(0, participants.length);
+      const winner = participants[randomIndex];
 
-    const winnerText =
-      `🏆 <b>ПОБЕДИТЕЛЬ РОЗЫГРЫША!</b>\n\n` +
-      `🎯 <b>Счастливый номер:</b> №${winner.number}\n` +
-      `👤 <b>Участник:</b> ${winner.username}\n` +
-      `🔗 <b>Профиль:</b> ${winner.profileUrl || 'не указан'}\n` +
-      `💬 <b>Комментарий:</b> «<i>${winner.commentText}</i>»\n` +
-      `📅 <b>Дата публикации:</b> ${winner.createdAt.toLocaleString('ru-RU', {
-        timeZone: 'Europe/Moscow',
-      })}\n\n` +
-      `<i>(Победитель выбран случайно из диапазона 1...${participants.length})</i>`;
+      await safeAnswerCallback(ctx, `🎉 Выбран победитель №${winner.number}!`);
 
-    const nextKeyboard = new InlineKeyboard().text(
-      '🔄 Выбрать другого (переиграть)',
-      'pick_random_winner'
-    );
+      // Defect 2.1: HTML escaping for winner announcement dynamic fields
+      const winnerText =
+        `🏆 <b>ПОБЕДИТЕЛЬ РОЗЫГРЫША!</b>\n\n` +
+        `🎯 <b>Счастливый номер:</b> №${winner.number}\n` +
+        `👤 <b>Участник:</b> ${escapeHtml(winner.username)}\n` +
+        `🔗 <b>Профиль:</b> ${winner.profileUrl ? escapeHtml(winner.profileUrl) : 'не указан'}\n` +
+        `💬 <b>Комментарий:</b> «<i>${escapeHtml(winner.commentText)}</i>»\n` +
+        `📅 <b>Дата публикации:</b> ${winner.createdAt.toLocaleString('ru-RU', {
+          timeZone: 'Europe/Moscow',
+        })}\n\n` +
+        `<i>(Победитель выбран случайно из диапазона 1...${participants.length})</i>`;
 
-    await ctx.reply(winnerText, {
-      parse_mode: 'HTML',
-      reply_markup: nextKeyboard,
-    });
+      const nextKeyboard = new InlineKeyboard().text(
+        '🔄 Выбрать другого (переиграть)',
+        'pick_random_winner'
+      );
+
+      await ctx.reply(winnerText, {
+        parse_mode: 'HTML',
+        reply_markup: nextKeyboard,
+        link_preview_options: { is_disabled: true },
+      });
+    } finally {
+      setTimeout(() => {
+        session.isPickingWinner = false;
+      }, 500);
+    }
   });
 
   return bot;

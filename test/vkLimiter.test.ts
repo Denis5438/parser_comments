@@ -1,3 +1,4 @@
+import assert from 'node:assert';
 import { VkRateLimiter, vkLimiter } from '../src/services/vkLimiter.js';
 
 async function runRateLimiterTests() {
@@ -118,8 +119,22 @@ async function runRateLimiterTests() {
     throw new Error('❌ Ошибка 29 должна была немедленно прервать выполнение!');
   }
 
-  // 4. Тест повтора при ошибках 9, 10 и сетевых сбоях
-  console.log('--- Тест 4: Повтор при ошибках 9, 10 и сети ---');
+  // 4. Тест повтора при ошибках 1, 9, 10, HTTP 502/503/504 и сетевых сбоях
+  console.log('--- Тест 4: Повтор при ошибках 1 (UNKNOWN), 9, 10, HTTP 503 и сети ---');
+  let unknownAttempts = 0;
+  const unknownResult = await limiter.execute(async () => {
+    unknownAttempts++;
+    if (unknownAttempts < 2) {
+      const err: any = new Error('Unknown error occurred');
+      err.code = 1; // VK Code 1
+      throw err;
+    }
+    return 'unknown_recovered';
+  }, 'unknown_error_test');
+  assert.strictEqual(unknownResult, 'unknown_recovered');
+  assert.strictEqual(unknownAttempts, 2);
+  console.log('✅ Тест ошибки VK 1 (UNKNOWN_ERROR): успешный повтор');
+
   let floodAttempts = 0;
   const floodResult = await limiter.execute(async () => {
     floodAttempts++;
@@ -130,12 +145,9 @@ async function runRateLimiterTests() {
     }
     return 'flood_recovered';
   }, 'flood_test');
-
-  if (floodResult === 'flood_recovered' && floodAttempts === 2) {
-    console.log('✅ Тест ошибки 9 (FLOOD): успешный повтор');
-  } else {
-    throw new Error(`❌ Ошибка 9 не была повторена должным образом: attempts=${floodAttempts}`);
-  }
+  assert.strictEqual(floodResult, 'flood_recovered');
+  assert.strictEqual(floodAttempts, 2);
+  console.log('✅ Тест ошибки 9 (FLOOD): успешный повтор');
 
   let internalAttempts = 0;
   const internalResult = await limiter.execute(async () => {
@@ -147,29 +159,37 @@ async function runRateLimiterTests() {
     }
     return 'internal_recovered';
   }, 'internal_error_test');
+  assert.strictEqual(internalResult, 'internal_recovered');
+  assert.strictEqual(internalAttempts, 2);
+  console.log('✅ Тест ошибки 10 (INTERNAL_ERROR): успешный повтор');
 
-  if (internalResult === 'internal_recovered' && internalAttempts === 2) {
-    console.log('✅ Тест ошибки 10 (INTERNAL_ERROR): успешный повтор');
-  } else {
-    throw new Error(`❌ Ошибка 10 не была повторена должным образом: attempts=${internalAttempts}`);
-  }
+  let httpAttempts = 0;
+  const httpResult = await limiter.execute(async () => {
+    httpAttempts++;
+    if (httpAttempts < 2) {
+      const err: any = new Error('Bad Gateway');
+      err.status = 502;
+      throw err;
+    }
+    return 'http_502_recovered';
+  }, 'http_502_test');
+  assert.strictEqual(httpResult, 'http_502_recovered');
+  assert.strictEqual(httpAttempts, 2);
+  console.log('✅ Тест HTTP 502 (Bad Gateway): успешный повтор');
 
   let networkAttempts = 0;
   const networkResult = await limiter.execute(async () => {
     networkAttempts++;
     if (networkAttempts < 2) {
-      const err: any = new Error('connect ECONNRESET 127.0.0.1:443');
-      err.code = 'ECONNRESET';
+      const err: any = new Error('getaddrinfo ENOTFOUND api.vk.com');
+      err.code = 'ENOTFOUND';
       throw err;
     }
     return 'network_recovered';
   }, 'network_test');
-
-  if (networkResult === 'network_recovered' && networkAttempts === 2) {
-    console.log('✅ Тест сетевой ошибки (ECONNRESET): успешный повтор');
-  } else {
-    throw new Error(`❌ Сетевая ошибка не была повторена должным образом: attempts=${networkAttempts}`);
-  }
+  assert.strictEqual(networkResult, 'network_recovered');
+  assert.strictEqual(networkAttempts, 2);
+  console.log('✅ Тест сетевой ошибки (ENOTFOUND): успешный повтор');
 
   // 5. Тест превышения максимального числа попыток
   console.log('--- Тест 5: Превышение maxRetries ---');
@@ -214,10 +234,48 @@ async function runRateLimiterTests() {
     throw new Error('❌ Отсутствуют необходимые методы в синглтоне vkLimiter');
   }
 
-  console.log('🎉 Все тесты VkRateLimiter / VkLimiter успешно пройдены!');
+  // 7. Тест отсутствия утечки счетчика активных запросов при retry backoff (Defect 1.1)
+  console.log('--- Тест 7: Регрессионный тест освобождения слота при повторах (Defect 1.1) ---');
+  const leakTestLimiter = new VkRateLimiter({
+    tokensPerSecond: 10,
+    bucketCapacity: 2,
+    maxConcurrent: 1,
+    minIntervalMs: 20,
+    maxRetries: 2,
+    baseDelayMs: 200,
+    maxDelayMs: 400,
+  });
+
+  let attemptCount = 0;
+  let activeWhileRetrying = -1;
+
+  const retryTask = leakTestLimiter.execute(async () => {
+    attemptCount++;
+    if (attemptCount === 1) {
+      // Планируем проверку activeRequests во время паузы перед 2-й попыткой
+      setTimeout(() => {
+        activeWhileRetrying = leakTestLimiter.getActiveRequests();
+      }, 50);
+      const err: any = new Error('Temporary glitch');
+      err.code = 10;
+      throw err;
+    }
+    return 'retry_done';
+  }, 'leak_test_task');
+
+  const retryResult = await retryTask;
+  assert.strictEqual(retryResult, 'retry_done');
+  assert.strictEqual(attemptCount, 2);
+  // В старой реализации activeRequests оставался равным 1 во время сна.
+  // В исправленной реализации activeRequests освобождается до сна: activeWhileRetrying === 0!
+  assert.strictEqual(activeWhileRetrying, 0, `activeRequests во время retry-бэкоффа должен быть 0, получено: ${activeWhileRetrying}`);
+  assert.strictEqual(leakTestLimiter.getActiveRequests(), 0, 'После завершения всех задач activeRequests должен быть 0');
+  console.log('✅ Тест 7 пройден: activeRequests освобождается перед сном при бэкоффе (нет блокировки/утечки параллельности)');
+
+  console.log('\n🎉 Все тесты VkRateLimiter / VkLimiter успешно пройдены!');
 }
 
 runRateLimiterTests().catch((err) => {
-  console.error('Ошибка в тестах rate limiter:', err);
+  console.error('❌ Ошибка в тестах rate limiter:', err);
   process.exit(1);
 });

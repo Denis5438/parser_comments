@@ -4,7 +4,26 @@ import fs from 'fs/promises';
 import { DeduplicationResult } from '../types.js';
 import { config } from '../config.js';
 
+/**
+ * Удаляет невалидные управляющие символы XML 1.0 (Defect 5.5)
+ * и экранирует формульные инъекции Excel (CWE-1236, Defect 5.1)
+ */
+export function sanitizeCellValue(val: any): any {
+  if (typeof val !== 'string') return val;
+  // 1. Фильтруем запрещенные символы XML 1.0
+  let cleaned = val.replace(/[\x00-\x08\x0B\x0C\x0E-\x1F\x7F]/g, '');
+  // 2. Защита от CSV/Excel formula injection (CWE-1236)
+  if (/^[=+\-@\t\r]/.test(cleaned)) {
+    cleaned = "'" + cleaned;
+  }
+  return cleaned;
+}
+
 export class ExcelService {
+  public sanitizeCellValue(val: any): any {
+    return sanitizeCellValue(val);
+  }
+
   /**
    * Генерирует стилизованный Excel-файл (.xlsx) с двумя листами:
    * 1. Участники с присвоенными номерами
@@ -23,6 +42,9 @@ export class ExcelService {
       const wordsPreview = result.keywordFilter.slice(0, 2).join(', ');
       sheetTitle = `Участники (${wordsPreview}${result.keywordFilter.length > 2 ? '...' : ''})`;
     }
+
+    // Санитизация имени листа: Excel запрещает: \ / ? * [ ] : (Defect 5.2)
+    sheetTitle = sheetTitle.replace(/[\\/?*:[\]]/g, '_');
 
     // Лимит длины названия листа в Excel — 31 символ
     if (sheetTitle.length > 31) {
@@ -65,9 +87,9 @@ export class ExcelService {
     for (const participant of result.participants) {
       const row = sheetParticipants.addRow({
         number: participant.number,
-        username: participant.username,
+        username: sanitizeCellValue(participant.username),
         profileUrl: participant.profileUrl || '—',
-        commentText: participant.commentText,
+        commentText: sanitizeCellValue(participant.commentText),
         createdAt: participant.createdAt.toLocaleString('ru-RU', {
           timeZone: 'Europe/Moscow',
         }),
@@ -137,11 +159,11 @@ export class ExcelService {
       const history = dup.comments.map((c, i) => `[${i + 1}] ${c.text}`).join(' | ');
       const row = sheetDuplicates.addRow({
         idx: dupIndex++,
-        username: dup.username,
+        username: sanitizeCellValue(dup.username),
         profileUrl: dup.profileUrl || '—',
         total: dup.totalComments,
-        reason: dup.reason,
-        commentsHistory: history,
+        reason: sanitizeCellValue(dup.reason),
+        commentsHistory: sanitizeCellValue(history.slice(0, 32000)),
       });
 
       row.height = 22;

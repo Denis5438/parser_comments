@@ -66,9 +66,10 @@ export class DzenScraper {
         }
       }
 
-      // 4. Запасной вариант: 24-значный hex ID прямо в URL
+      // 4. Запасной вариант: 24-значный hex ID прямо в URL (исключая ID канала после /id/)
       if (!documentId) {
-        const hexMatch = normalizedUrl.match(/([a-f0-9]{24})/i);
+        const urlWithoutChannel = normalizedUrl.replace(/\/id\/[a-f0-9]{24}/i, '');
+        const hexMatch = urlWithoutChannel.match(/([a-f0-9]{24})/i);
         if (hexMatch) {
           documentId = `native:${hexMatch[1]}`;
         }
@@ -99,9 +100,14 @@ export class DzenScraper {
     const comments: RawComment[] = [];
     let fetchAfterCommentId: number | string | null = null;
     let hasMore = true;
+    let retryCount = 0;
+    const MAX_PAGE_RETRIES = 3;
 
     while (hasMore) {
       try {
+        // Pacing: задержка 80мс между запросами для предотвращения SmartCaptcha
+        await new Promise((resolve) => setTimeout(resolve, 80));
+
         const params: Record<string, string | number> = {
           documentId,
           batchSize: 50,
@@ -124,6 +130,8 @@ export class DzenScraper {
           },
           timeout: 15000,
         });
+
+        retryCount = 0; // Сброс счетчика при успешном ответе
 
         const data = res.data;
         const items = data?.items || [];
@@ -170,6 +178,9 @@ export class DzenScraper {
                 let hasMoreChild = true;
 
                 while (hasMoreChild) {
+                  // Pacing между запросами дочерних комментариев
+                  await new Promise((resolve) => setTimeout(resolve, 80));
+
                   const childParams: Record<string, string | number> = {
                     rootCommentId: ed.id,
                     documentId,
@@ -251,10 +262,19 @@ export class DzenScraper {
           hasMore = false;
         }
       } catch (err: any) {
-        if (comments.length > 0) {
-          break;
+        if (retryCount < MAX_PAGE_RETRIES) {
+          retryCount++;
+          const backoff = 1500 * Math.pow(2, retryCount - 1);
+          console.warn(
+            `[DZEN] Ошибка при сборе комментариев Дзен (${err?.message || err}). Повтор ${retryCount}/${MAX_PAGE_RETRIES} через ${backoff}мс...`
+          );
+          await new Promise((resolve) => setTimeout(resolve, backoff));
+          continue;
         }
-        throw new Error(`Ошибка при сборе комментариев Дзен: ${err?.message || err}`);
+
+        throw new Error(
+          `Сбор комментариев Дзен прерван из-за сетевой ошибки после ${MAX_PAGE_RETRIES} попыток: ${err?.message || err}. Собрано ${comments.length} шт.`
+        );
       }
     }
 

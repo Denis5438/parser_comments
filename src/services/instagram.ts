@@ -23,7 +23,7 @@ export class InstagramScraper {
    */
   public extractShortcode(url: string): string | null {
     try {
-      const match = url.match(/\/(p|reel|tv)\/([A-Za-z0-9_-]+)/);
+      const match = url.match(/\/(p|reels?|tv)\/([A-Za-z0-9_-]+)/i);
       return match ? match[2] : null;
     } catch {
       return null;
@@ -56,8 +56,11 @@ export class InstagramScraper {
       headers['Cookie'] = `sessionid=${config.instagramSessionId};`;
     }
 
-    let minId: string | null = null;
+    let cursor: string | null = null;
+    let cursorParamName: 'min_id' | 'max_id' = 'min_id';
     let hasMore = true;
+    let retryCount = 0;
+    const MAX_PAGE_RETRIES = 3;
 
     while (hasMore) {
       try {
@@ -65,8 +68,8 @@ export class InstagramScraper {
         const params: Record<string, string | boolean> = {
           can_support_threading: true,
         };
-        if (minId) {
-          params.min_id = minId;
+        if (cursor) {
+          params[cursorParamName] = cursor;
         }
 
         const res = await axios.get(apiUrl, {
@@ -74,6 +77,8 @@ export class InstagramScraper {
           headers,
           timeout: 15000,
         });
+
+        retryCount = 0;
 
         const data = res.data;
 
@@ -139,21 +144,42 @@ export class InstagramScraper {
           await options.onProgress(comments.length);
         }
 
-        minId = data?.next_min_id || null;
-        if (!minId || !data?.has_more_comments) {
+        const nextMinId = data?.next_min_id;
+        const nextMaxId = data?.next_max_id;
+        if (nextMinId) {
+          cursor = nextMinId;
+          cursorParamName = 'min_id';
+        } else if (nextMaxId) {
+          cursor = nextMaxId;
+          cursorParamName = 'max_id';
+        } else {
+          cursor = null;
+        }
+
+        const hasMoreComments = Boolean(data?.has_more_comments || data?.has_more_headload_comments);
+        if (!cursor || !hasMoreComments) {
           hasMore = false;
         }
       } catch (err: any) {
-        if (comments.length > 0) {
-          // Если часть комментариев уже собрана, завершаем без падения
-          break;
-        }
         if (err?.response?.status === 400 || err?.response?.status === 401) {
           throw new Error(
             'Инстаграм ограничил публичный доступ к этой публикации. Укажите INSTAGRAM_SESSION_ID в .env для авторизованного сбора.'
           );
         }
-        throw new Error(`Ошибка при сборе комментариев Instagram: ${err?.message || err}`);
+
+        if (retryCount < MAX_PAGE_RETRIES) {
+          retryCount++;
+          const backoff = 1500 * Math.pow(2, retryCount - 1);
+          console.warn(
+            `[Instagram] Ошибка при сборе комментариев (${err?.message || err}). Повтор ${retryCount}/${MAX_PAGE_RETRIES} через ${backoff}мс...`
+          );
+          await new Promise((resolve) => setTimeout(resolve, backoff));
+          continue;
+        }
+
+        throw new Error(
+          `Сбор комментариев Instagram прерван из-за сетевой ошибки после ${MAX_PAGE_RETRIES} попыток: ${err?.message || err}. Собрано ${comments.length} шт.`
+        );
       }
     }
 
